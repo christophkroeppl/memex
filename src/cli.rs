@@ -193,6 +193,12 @@ struct IndexArgs {
     /// Skip indexing ZCode sessions
     #[arg(long = "no-zcode", default_value_t = false, hide = true)]
     no_zcode: bool,
+    /// Index KiloCode CLI sessions from ~/.local/share/kilo/kilo.db [default: true]
+    #[arg(long, default_value_t = true, hide = true)]
+    kilocode: bool,
+    /// Skip indexing KiloCode CLI sessions
+    #[arg(long = "no-kilocode", default_value_t = false, hide = true)]
+    no_kilocode: bool,
     /// Generate embeddings for semantic search during indexing
     #[arg(long, help_heading = "Embeddings")]
     embeddings: bool,
@@ -2642,6 +2648,7 @@ fn build_ingest_options(index: &IndexArgs, config: &UserConfig) -> Result<Ingest
         include_antigravity: index.source_enabled(IndexSource::Antigravity),
         include_bob: index.source_enabled(IndexSource::Bob),
         include_zcode: index.source_enabled(IndexSource::Zcode),
+        include_kilocode: index.source_enabled(IndexSource::Kilocode),
         include_kiro: index.source_enabled(IndexSource::Kiro),
         exclude_patterns: excludes,
         embeddings,
@@ -6102,6 +6109,7 @@ fn run_share(session_id: String, title: Option<String>, root: Option<PathBuf>) -
         crate::types::SourceKind::Bob => "bob",
         crate::types::SourceKind::Zcode => "zcode",
         crate::types::SourceKind::Kiro => "kiro",
+        crate::types::SourceKind::Kilocode => "kilocode",
     };
     let source_path = &record.source_path;
     if record.source == crate::types::SourceKind::Bob {
@@ -6112,6 +6120,11 @@ fn run_share(session_id: String, title: Option<String>, root: Option<PathBuf>) -
     if record.source == crate::types::SourceKind::Zcode {
         return Err(anyhow!(
             "sharing is not supported for ZCode sessions: {source_path} is a database, not a transcript file"
+        ));
+    }
+    if record.source == crate::types::SourceKind::Kilocode {
+        return Err(anyhow!(
+            "sharing is not supported for KiloCode sessions: {source_path} is a database, not a transcript file"
         ));
     }
 
@@ -7447,6 +7460,9 @@ fn build_index_command_args(
     }
     if !index.zcode || index.no_zcode {
         args.push("--no-zcode".to_string());
+    }
+    if !index.kilocode || index.no_kilocode {
+        args.push("--no-kilocode".to_string());
     }
     if let Some(listen) = mcp_listen {
         args.push("--mcp".to_string());
@@ -8979,6 +8995,8 @@ mod tests {
             no_bob: false,
             zcode: false,
             no_zcode: false,
+            kilocode: false,
+            no_kilocode: false,
             kiro: false,
             no_kiro: false,
             embeddings: false,
@@ -9045,6 +9063,8 @@ mod tests {
             no_bob: false,
             zcode: false,
             no_zcode: false,
+            kilocode: false,
+            no_kilocode: false,
             kiro: true,
             no_kiro: false,
             embeddings: false,
@@ -9104,6 +9124,8 @@ mod tests {
             no_bob: false,
             zcode: false,
             no_zcode: false,
+            kilocode: false,
+            no_kilocode: false,
             kiro: true,
             no_kiro: false,
             embeddings: false,
@@ -9165,6 +9187,8 @@ mod tests {
             no_bob: false,
             zcode: false,
             no_zcode: false,
+            kilocode: false,
+            no_kilocode: false,
             kiro: true,
             no_kiro: false,
             embeddings: false,
