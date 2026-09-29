@@ -887,7 +887,10 @@ pub(crate) mod tests {
     #[test]
     fn virtual_paths_round_trip_and_select_one_session() {
         let temp = tempfile::tempdir().unwrap();
-        let database = temp.path().join("kilo.db");
+        // The raw store only classifies under a KiloCode data directory, so the
+        // shape a real install has is what the round-trip has to survive.
+        let database = temp.path().join("kilo/kilo.db");
+        std::fs::create_dir_all(database.parent().unwrap()).unwrap();
         fixture_db(&database);
         let encoded = virtual_path(&database, "ses/child.with.dots");
         let (owner, id) = split_virtual_path(&encoded).unwrap();
@@ -895,6 +898,9 @@ pub(crate) mod tests {
         assert_eq!(id, "ses/child.with.dots");
         assert!(matches_path(&encoded.to_string_lossy()));
         assert!(matches_path(&database.to_string_lossy()));
+        // A `kilo.db` outside a KiloCode data directory is somebody else's file.
+        let stranger = temp.path().join("elsewhere/kilo.db");
+        assert!(!matches_path(&stranger.to_string_lossy()));
         let ids = AtomicU64::new(1);
         let mut selected = Vec::new();
         let parsed = parse_index_records(
