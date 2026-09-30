@@ -6476,8 +6476,8 @@ fn kilocode_refresh_preserves_other_session_ids_and_embeddings() {
     )
     .unwrap();
     assert!(!skipped_part.full_scan);
-    assert_eq!(skipped_part.records_added, 0);
-    assert_eq!(skipped_part.records_embedded, 0);
+    assert_eq!(skipped_part.report.records_added, 0);
+    assert_eq!(skipped_part.report.records_embedded, 0);
     assert_eq!(main_ids(), original_main_ids);
     drop(index);
 
