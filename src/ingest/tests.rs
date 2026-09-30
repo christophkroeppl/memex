@@ -6429,12 +6429,57 @@ fn kilocode_refresh_preserves_other_session_ids_and_embeddings() {
     assert_eq!(child_distance(), original_distance);
     drop(index);
 
-    // Usage-only writes never replay transcripts.
+    let main_ids = || {
+        let mut ids = SearchIndex::open_or_create(&paths.index)
+            .unwrap()
+            .records_by_session_id("ses_main")
+            .unwrap()
+            .into_iter()
+            .map(|record| record.doc_id)
+            .collect::<Vec<_>>();
+        ids.sort_unstable();
+        ids
+    };
+    let original_main_ids = main_ids();
+
+    // A real usage-only commit must preserve the affected session too.
+    writer
+        .execute_batch(
+            "UPDATE message SET data = json_set(data, '$.tokens.input', 999, '$.cost', 4.2),
+                time_updated = 10000 WHERE id = 'msg_a';
+             UPDATE session SET time_updated = 10000 WHERE id = 'ses_main';
+             UPDATE part SET data = json_set(data, '$.tokens.input', 999),
+                time_updated = 10000 WHERE id = 'prt_f';",
+        )
+        .unwrap();
     let usage_only = full();
     assert_eq!(usage_only.records_added, 0);
     assert_eq!(usage_only.records_embedded, 0);
+    assert_eq!(main_ids(), original_main_ids);
     assert_eq!(child_records()[0].doc_id, child_id);
     assert_eq!(child_distance(), original_distance);
+
+    // New skipped parts must not change the logical checkpoint size, either.
+    writer
+        .execute_batch(
+            "INSERT INTO part VALUES ('prt_accounting', 'msg_a', 'ses_main', 10000, 10000,
+                '{\"type\":\"step-finish\",\"tokens\":{\"input\":999}}');",
+        )
+        .unwrap();
+    let index = SearchIndex::open_or_create_for_continuous_ingest(&paths.index).unwrap();
+    let skipped_part = ingest_dirty(
+        &paths,
+        &index,
+        &options,
+        &lease,
+        &HashSet::from([database.with_file_name("kilo.db-wal")]),
+    )
+    .unwrap();
+    assert!(!skipped_part.full_scan);
+    assert_eq!(skipped_part.records_added, 0);
+    assert_eq!(skipped_part.records_embedded, 0);
+    assert_eq!(main_ids(), original_main_ids);
+    drop(index);
 
     writer
         .execute("DELETE FROM part WHERE id = 'prt_t'", [])

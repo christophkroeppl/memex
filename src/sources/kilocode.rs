@@ -31,7 +31,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 pub const VERSIONS: ParserVersions = ParserVersions {
     identity: 1,
-    index: 2,
+    index: 3,
     usage: 1,
 };
 
@@ -81,9 +81,12 @@ pub fn roots() -> Vec<PathBuf> {
 }
 
 fn default_data_root() -> PathBuf {
-    directories::BaseDirs::new()
-        .map(|dirs| dirs.data_dir().join("kilo"))
-        .unwrap_or_else(|| super::common::home().join(".local/share/kilo"))
+    // Kilo uses XDG paths on macOS and Windows too, rather than native data dirs.
+    std::env::var_os("XDG_DATA_HOME")
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| super::common::home().join(".local/share"))
+        .join("kilo")
 }
 
 fn roots_for(kilo_data_dir: Option<&std::ffi::OsStr>, default: &Path) -> Vec<PathBuf> {
@@ -175,8 +178,42 @@ fn table_names(conn: &Connection) -> Result<std::collections::HashSet<String>> {
 pub(crate) struct SessionFingerprint {
     pub id: String,
     pub fingerprint: String,
-    /// Number of joined message/part rows, also returned as the parser offset.
+    /// Number of transcript parts, including compaction boundaries and reasoning.
+    /// Skipped accounting/structural parts do not advance the parser offset.
     pub size: u64,
+}
+
+fn is_transcript_part(part_type: &str) -> bool {
+    matches!(part_type, "text" | "reasoning" | "tool" | "compaction")
+}
+
+/// Only fields used by the record projection belong in its content fingerprint.
+fn transcript_part_data(part: &Value) -> Option<Value> {
+    let part_type = part.get("type").and_then(Value::as_str)?;
+    match part_type {
+        "text" | "reasoning" => Some(serde_json::json!({
+            "type": part_type,
+            "text": part.get("text").and_then(Value::as_str),
+        })),
+        "tool" => {
+            let is_error = part.pointer("/state/status").and_then(Value::as_str) == Some("error");
+            let output = part
+                .pointer("/state/output")
+                .and_then(value_to_string)
+                .or_else(|| part.pointer("/state/error").and_then(value_to_string))
+                .or_else(|| is_error.then(|| "[tool error]".to_string()));
+            Some(serde_json::json!({
+                "type": part_type,
+                "tool": part.get("tool").and_then(Value::as_str).unwrap_or("unknown"),
+                "call_id": part.get("callID").and_then(Value::as_str).filter(|id| !id.is_empty()),
+                "input": part.pointer("/state/input").and_then(value_to_string),
+                "output": output,
+                "is_error": is_error,
+            }))
+        }
+        "compaction" => Some(serde_json::json!({"type": part_type})),
+        _ => None,
+    }
 }
 
 /// Hash actual content from one SQLite snapshot; usage-only writes do not
@@ -189,55 +226,70 @@ pub(crate) fn enumerate_sessions(database: &Path) -> Result<Vec<SessionFingerpri
         .query_map([], |row| row.get::<_, String>(0))?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     drop(sessions);
+    let mut metadata_statement = transaction.prepare(
+        "SELECT id, parent_id, directory, title, time_created FROM session WHERE id = ?1",
+    )?;
+    let mut parts_statement = transaction.prepare(
+        "SELECT m.id, m.time_created, m.data, p.id, p.time_created, p.data \
+         FROM message m JOIN part p ON p.message_id = m.id \
+         WHERE m.session_id = ?1 ORDER BY m.time_created, m.id, p.time_created, p.id",
+    )?;
     let mut result = Vec::with_capacity(ids.len());
     for id in ids {
         let mut hash = Sha256::new();
-        for sql in [
-            "SELECT * FROM session WHERE id = ?1",
-            "SELECT * FROM message WHERE session_id = ?1 ORDER BY time_created, id",
-            "SELECT p.* FROM message m JOIN part p ON p.message_id = m.id \
-             WHERE m.session_id = ?1 ORDER BY m.time_created, m.id, p.time_created, p.id",
-        ] {
-            hash.update(sql.as_bytes());
-            let mut statement = transaction.prepare(sql)?;
-            let columns = statement.column_count();
-            let mut rows = statement.query([&id])?;
-            while let Some(row) = rows.next()? {
-                hash.update([0xff]);
-                for column in 0..columns {
-                    use rusqlite::types::ValueRef;
-                    let value = row.get_ref(column)?;
-                    let kind = match value {
-                        ValueRef::Null => 0,
-                        ValueRef::Integer(_) => 1,
-                        ValueRef::Real(_) => 2,
-                        ValueRef::Text(_) => 3,
-                        ValueRef::Blob(_) => 4,
-                    };
-                    hash.update([kind]);
-                    match value {
-                        ValueRef::Integer(value) => hash.update(value.to_le_bytes()),
-                        ValueRef::Real(value) => hash.update(value.to_le_bytes()),
-                        ValueRef::Text(value) | ValueRef::Blob(value) => {
-                            hash.update((value.len() as u64).to_le_bytes());
-                            hash.update(value);
-                        }
-                        ValueRef::Null => {}
-                    }
-                }
-            }
+        // Keep labels, hierarchy, cwd, and timestamp fallbacks current without
+        // replaying for session accounting fields such as cost or time_updated.
+        let metadata = metadata_statement.query_row([&id], |row| {
+            Ok(serde_json::json!({
+                "id": row.get::<_, String>(0)?,
+                "parent_id": row.get::<_, Option<String>>(1)?,
+                "directory": row.get::<_, Option<String>>(2)?,
+                "title": row.get::<_, Option<String>>(3)?,
+                "time_created": row.get::<_, Option<i64>>(4)?.unwrap_or_default(),
+            }))
+        })?;
+        hash.update(serde_json::to_vec(&metadata)?);
+        let mut size = 0;
+        let mut rows = parts_statement.query([&id])?;
+        while let Some(row) = rows.next()? {
+            let message_data = row.get::<_, Option<String>>(2)?.unwrap_or_default();
+            let part_data = row.get::<_, Option<String>>(5)?.unwrap_or_default();
+            let Ok(message) = serde_json::from_str::<Value>(&message_data) else {
+                continue;
+            };
+            let Ok(part) = serde_json::from_str::<Value>(&part_data) else {
+                continue;
+            };
+            let Some(part) = transcript_part_data(&part) else {
+                continue;
+            };
+            let transcript = serde_json::json!({
+                "message_id": row.get::<_, String>(0)?,
+                "message_time_created": row.get::<_, Option<i64>>(1)?.unwrap_or_default(),
+                "role": message
+                    .get("role")
+                    .and_then(Value::as_str)
+                    .unwrap_or("assistant"),
+                "cwd": message
+                    .pointer("/path/cwd")
+                    .and_then(Value::as_str)
+                    .filter(|cwd| !cwd.is_empty()),
+                "part_id": row.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                "part_time_created": row.get::<_, Option<i64>>(4)?.unwrap_or_default(),
+                "part": part,
+            });
+            hash.update([0xff]);
+            hash.update(serde_json::to_vec(&transcript)?);
+            size += 1;
         }
-        let size = transaction.query_row(
-            "SELECT count(*) FROM message m JOIN part p ON p.message_id = m.id WHERE m.session_id = ?1",
-            [&id],
-            |row| row.get::<_, u64>(0),
-        )?;
         result.push(SessionFingerprint {
             id,
             fingerprint: format!("{:x}", hash.finalize()),
             size,
         });
     }
+    drop(parts_statement);
+    drop(metadata_statement);
     transaction.commit()?;
     Ok(result)
 }
@@ -328,7 +380,6 @@ pub(crate) fn parse_index_records(
             })
             .with_context(|| format!("read messages in {}", path.display()))?
             .collect::<std::result::Result<Vec<_>, _>>()?;
-        row_count += rows.len() as u64;
         // A compaction part closes the prompt that preceded it, so the summary
         // that follows reads as its own conversation until the next user turn.
         let mut compacted = false;
@@ -346,6 +397,7 @@ pub(crate) fn parse_index_records(
                 .and_then(Value::as_str)
                 .unwrap_or("assistant");
             let part_type = part.get("type").and_then(Value::as_str).unwrap_or("");
+            row_count += u64::from(is_transcript_part(part_type));
             if part_type == "compaction" {
                 compacted = true;
                 continue;
@@ -809,7 +861,7 @@ pub(crate) mod tests {
         fixture_db(&database);
         let (records, parsed) = parse(&database, false);
         assert_eq!(parsed.diagnostics, ParseDiagnostics::default());
-        assert_eq!(parsed.offset, 6);
+        assert_eq!(parsed.offset, 4);
         assert_eq!(parsed.session_cwd.as_deref(), Some("/work/nipponhomes"));
         assert_eq!(records.len(), 4);
         assert_eq!(records[0].role, "user");
@@ -960,7 +1012,7 @@ pub(crate) mod tests {
         assert_eq!(before.len(), 2);
         assert_eq!(before[0].id, "ses_child");
         assert_eq!(before[0].size, 1);
-        assert_eq!(before[1].size, 5);
+        assert_eq!(before[1].size, 3);
         let conn = Connection::open(&database).unwrap();
         conn.execute(
             "INSERT INTO part VALUES ('prt_n', 'msg_u', 'ses_main', 1500, 1500, ?1)",
@@ -971,7 +1023,7 @@ pub(crate) mod tests {
         let after = enumerate_sessions(&database).unwrap();
         assert_ne!(before[1].fingerprint, after[1].fingerprint);
         assert_eq!(before[0].fingerprint, after[0].fingerprint);
-        assert_eq!(after[1].size, 6);
+        assert_eq!(after[1].size, 4);
     }
 
     #[test]
@@ -986,6 +1038,108 @@ pub(crate) mod tests {
             roots_for(Some(std::ffi::OsStr::new("")), &default),
             vec![PathBuf::from("/data/kilo")]
         );
+    }
+
+    #[test]
+    fn default_data_root_uses_xdg_on_every_platform() {
+        let _guard = crate::test_support::env_lock();
+        let temp = tempfile::tempdir().unwrap();
+        let data_root = temp.path().join("xdg-data");
+        let fallback = super::super::common::home().join(".local/share/kilo");
+        for (configured, expected) in [
+            (None, fallback.clone()),
+            (Some(std::ffi::OsStr::new("")), fallback),
+            (Some(data_root.as_os_str()), data_root.join("kilo")),
+        ] {
+            let _env = crate::test_support::EnvVarGuard::set_os(&[("XDG_DATA_HOME", configured)]);
+            assert_eq!(default_data_root(), expected);
+        }
+    }
+
+    #[test]
+    fn fingerprints_ignore_accounting_and_skipped_parts() {
+        let temp = tempfile::tempdir().unwrap();
+        let database = temp.path().join("kilo.db");
+        fixture_db(&database);
+        let before = enumerate_sessions(&database).unwrap();
+        let (records_before, parsed_before) = parse(&database, true);
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch(
+            "ALTER TABLE session ADD COLUMN cost REAL;
+             UPDATE session SET cost = 4.2, time_updated = 10000 WHERE id = 'ses_main';
+             UPDATE message SET data = json_set(data, '$.tokens.input', 999, '$.cost', 4.2,
+                '$.time.completed', 10000, '$.finish', 'stop'), time_updated = 10000
+                WHERE id = 'msg_a';
+             UPDATE part SET data = json_set(data, '$.tokens.input', 999),
+                time_updated = 10000 WHERE id = 'prt_f';
+             INSERT INTO part VALUES ('prt_accounting', 'msg_a', 'ses_main', 10000, 10000,
+                '{\"type\":\"step-finish\",\"tokens\":{\"input\":999}}');
+             INSERT INTO part VALUES ('prt_patch', 'msg_a', 'ses_main', 10001, 10001,
+                '{\"type\":\"patch\",\"hash\":\"edited\"}');
+             INSERT INTO part VALUES ('prt_file', 'msg_a', 'ses_main', 10002, 10002,
+                '{\"type\":\"file\",\"url\":\"file:///work/example\"}');
+             INSERT INTO part VALUES ('prt_start', 'msg_a', 'ses_main', 10003, 10003,
+                '{\"type\":\"step-start\",\"snapshot\":\"new\"}');",
+        )
+        .unwrap();
+        let after = enumerate_sessions(&database).unwrap();
+        for (before, after) in before.iter().zip(&after) {
+            assert_eq!(before.id, after.id);
+            assert_eq!(before.fingerprint, after.fingerprint);
+            assert_eq!(before.size, after.size);
+        }
+        let (records_after, parsed_after) = parse(&database, true);
+        assert_eq!(parsed_before.offset, parsed_after.offset);
+        assert_eq!(
+            serde_json::to_value(records_before).unwrap(),
+            serde_json::to_value(records_after).unwrap(),
+        );
+        let usage = parse_usage_file(&database).unwrap();
+        assert_eq!(usage.events[0].tokens.uncached_input, 999);
+        assert_eq!(usage.events[0].source_cost_usd, Some(4.2));
+
+        // Tool output is transcript content even when the part count is unchanged.
+        conn.execute(
+            "UPDATE part SET data = json_set(data, '$.state.output', 'new contents') WHERE id = 'prt_c'",
+            [],
+        )
+        .unwrap();
+        let changed = enumerate_sessions(&database).unwrap();
+        assert_ne!(after[1].fingerprint, changed[1].fingerprint);
+        assert_eq!(after[1].size, changed[1].size);
+        assert_eq!(after[0].fingerprint, changed[0].fingerprint);
+
+        // Removing non-content rows must also leave the fingerprint unchanged.
+        conn.execute_batch(
+            "DELETE FROM part WHERE id IN ('prt_accounting', 'prt_patch', 'prt_file', 'prt_start');",
+        )
+        .unwrap();
+        let removed = enumerate_sessions(&database).unwrap();
+        assert_eq!(changed[1].fingerprint, removed[1].fingerprint);
+        assert_eq!(changed[1].size, removed[1].size);
+    }
+
+    #[test]
+    fn fingerprints_track_session_and_message_metadata() {
+        let temp = tempfile::tempdir().unwrap();
+        let database = temp.path().join("kilo.db");
+        fixture_db(&database);
+        let conn = Connection::open(&database).unwrap();
+        for mutation in [
+            "UPDATE session SET title = 'Renamed' WHERE id = 'ses_main'",
+            "UPDATE session SET directory = '/work/other' WHERE id = 'ses_main'",
+            "UPDATE session SET parent_id = 'ses_parent' WHERE id = 'ses_main'",
+            "UPDATE session SET time_created = 900 WHERE id = 'ses_main'",
+            "UPDATE message SET data = json_set(data, '$.path.cwd', '/work/turn') WHERE id = 'msg_a'",
+            "UPDATE message SET data = json_set(data, '$.role', 'user') WHERE id = 'msg_a'",
+        ] {
+            let before = enumerate_sessions(&database).unwrap();
+            conn.execute(mutation, []).unwrap();
+            let after = enumerate_sessions(&database).unwrap();
+            assert_ne!(before[1].fingerprint, after[1].fingerprint, "{mutation}");
+            assert_eq!(before[1].size, after[1].size);
+            assert_eq!(before[0].fingerprint, after[0].fingerprint);
+        }
     }
 
     #[test]
